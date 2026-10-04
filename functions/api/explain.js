@@ -1,17 +1,11 @@
 /**
- * POST /api/explain   (Vercel Edge / Cloudflare Pages Function with Upstash Rate Limiting)
+ * POST /api/explain   (Vercel Edge Native Serverless Runtime)
  *
  * Optional "explain in simple words" step. It receives ONLY:
  *   - a redacted copy of the message (CNIC / phone / long numbers already removed in the browser)
  *   - the ids of the rules that fired, and the verdict level
  * It asks a free-tier Gemini model to explain the verdict in plain language.
  * The AI cannot change the verdict: that is decided by fixed rules in the browser.
- *
- * Environment (Vercel/Pages Settings -> Environment Variables):
- *   GEMINI_API_KEY           required (secret)
- *   GEMINI_MODEL             optional, default "gemini-2.5-flash".
- *   UPSTASH_REDIS_REST_URL   required (secret)
- *   UPSTASH_REDIS_REST_TOKEN required (secret)
  */
 
 const LEVELS = new Set(['high', 'suspicious', 'caution', 'none']);
@@ -59,7 +53,6 @@ function json(body, status = 200) {
   });
 }
 
-// Defence in depth: the browser already redacts, but never trust the client.
 function redactAgain(text) {
   return String(text)
     .replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, '[EMAIL]')
@@ -68,24 +61,26 @@ function redactAgain(text) {
     .slice(0, 1200);
 }
 
-export async function onRequestPost({ request, env }) {
-  // Same-origin validation.
-  const origin = request.headers.get('Origin');
-  if (origin && origin !== new URL(request.url).origin) return json({ error: 'forbidden' }, 403);
+// Fixed endpoint trigger signature for Vercel's Engine
+export async function POST(request) {
+  // Read Gemini API Key using standard Vercel syntax
+  const GEMINI_KEY = process.env.GEMINI_API_KEY;
+  if (!GEMINI_KEY) return json({ error: 'not_configured' }, 503);
 
-  if (!env.GEMINI_API_KEY) return json({ error: 'not_configured' }, 503);
+  // Read Upstash Keys using standard Vercel syntax
+  const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+  const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
   // --- UPSTASH NATIVE EDGE RATE LIMITER ---
-  if (env.UPSTASH_REDIS_REST_URL && env.UPSTASH_REDIS_REST_TOKEN) {
+  if (UPSTASH_URL && UPSTASH_TOKEN) {
     try {
-      // Get visitor's IP address tracking key safely from Vercel / Cloudflare headers
-      const ip = request.headers.get('x-forwarded-for') || request.headers.get('CF-Connecting-IP') || '127.0.0.1';
-      const redisKey = `ratelimit:${ip.split(',')[0].trim()}`;
+      const rawIp = request.headers.get('x-forwarded-for') || '127.0.0.1';
+      const cleanIp = rawIp.split(',')[0].trim(); 
+      const redisKey = `ratelimit:${cleanIp}`;
       
-      // Multi-exec Redis commands to check limits dynamically via HTTP API
-      const response = await fetch(`${env.UPSTASH_REDIS_REST_URL}/multi`, {
+      const response = await fetch(`${UPSTASH_URL}/multi`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}` },
+        headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
         body: JSON.stringify([
           ['INCR', redisKey],
           ['EXPIRE', redisKey, 60, 'NX']
@@ -94,17 +89,15 @@ export async function onRequestPost({ request, env }) {
 
       if (response.ok) {
         const result = await response.json();
-        // Extract the increment result value from the multi array pipeline response
-        const currentRequests = result?.[0]?.result;
+        // Accessing multi pipeline responses safely from Upstash response structure
+        const currentRequests = result && result[0] && result[0].result;
         
-        // Block request if user hits the button more than 5 times in 60 seconds
         if (typeof currentRequests === 'number' && currentRequests > 5) {
           return json({ error: 'rate_limited' }, 429);
         }
       }
     } catch (e) {
-      // Fail open: If Upstash falls over, don't break the user experience
-      console.error('Rate limiting error:', e);
+      console.error('Rate limiting internal tracer fallback:', e);
     }
   }
 
@@ -118,7 +111,6 @@ export async function onRequestPost({ request, env }) {
   const lang = body && body.lang === 'ur' ? 'ur' : 'en';
   const level = body && body.level;
   
-  // FIXED REGEX: Fixed backslash escaping issue from original script
   const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}\$/.test(x));
   if (!LEVELS.has(level) || !idsOk(body.findings, 25) || !idsOk(body.entities, 10) || typeof body.text !== 'string') {
     return json({ error: 'bad_request' }, 400);
@@ -138,7 +130,7 @@ export async function onRequestPost({ request, env }) {
     '</message>'
   ].join('\n');
 
-  const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
   const generationConfig = { temperature: 0.2, maxOutputTokens: 700 };
   if (model.includes('2.5')) generationConfig.thinkingConfig = { thinkingBudget: 0 };
 
@@ -146,7 +138,7 @@ export async function onRequestPost({ request, env }) {
   try {
     upstream = await fetch(`https://googleapis.com{encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM }] },
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -169,14 +161,9 @@ export async function onRequestPost({ request, env }) {
     return json({ error: 'upstream_error' }, 502);
   }
 
-  // FIXED PROPERTY PATH: Re-added array [0] index accessor safely so Gemini mapping works
   const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
   if (!text) return json({ error: 'empty' }, 502);
 
   return json({ text: text.slice(0, 1500) });
-}
-
-export async function onRequest() {
-  return json({ error: 'method_not_allowed' }, 405);
 }
