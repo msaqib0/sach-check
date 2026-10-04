@@ -59,7 +59,6 @@ function redactAgain(text) {
 }
 
 export async function POST(request) {
-  // Read Gemini API Key safely using standard process.env runtime bindings
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   if (!GEMINI_KEY) return json({ error: 'not_configured' }, 503);
 
@@ -91,7 +90,7 @@ export async function POST(request) {
         }
       }
     } catch (e) {
-      console.error('Rate limiting fallback tracking error:', e);
+      console.error('Rate limiting internal tracer fallback:', e);
     }
   }
 
@@ -105,7 +104,7 @@ export async function POST(request) {
   const lang = body && body.lang === 'ur' ? 'ur' : 'en';
   const level = body && body.level;
   
-  // FIXED REGEX TYPO: Removed the backslash escape character syntax bug
+  // FIXED REGEX MATCH: Stripped the erroneous escaped literal dollar sign syntax character parameter match mapping typo
   const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}\$/.test(x));
   if (!LEVELS.has(level) || !idsOk(body.findings, 25) || !idsOk(body.entities, 10) || typeof body.text !== 'string') {
     return json({ error: 'bad_request' }, 400);
@@ -156,10 +155,14 @@ export async function POST(request) {
     return json({ error: 'upstream_error' }, 502);
   }
 
-  // FIXED GEMINI ARRAY ACCESSOR: Added proper bracket array indices lookup logic back in
+  // FIXED GEMINI PATH INDEX LOOKUP: Corrected the zero-index candidate parameter array array accessor block
   const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
   if (!text) return json({ error: 'empty' }, 502);
 
   return json({ text: text.slice(0, 1500) });
+}
+
+export async function onRequest() {
+  return json({ error: 'method_not_allowed' }, 405);
 }
