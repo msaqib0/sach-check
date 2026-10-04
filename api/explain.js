@@ -1,9 +1,9 @@
 /**
- * POST /api/explain   (Vercel Edge Native Serverless Runtime Layout Route)
+ * POST /api/explain   (Vercel Edge Function)
  */
 
 export const config = {
-  runtime: 'edge', // Explicitly tells Vercel to host this on their low-latency Edge engine
+  runtime: 'edge',
 };
 
 const LEVELS = new Set(['high', 'suspicious', 'caution', 'none']);
@@ -58,6 +58,14 @@ function redactAgain(text) {
     .slice(0, 1200);
 }
 
+// Rule IDs: lowercase letters and underscores only.
+const FINDING_RE = /^[a-z_]{1,40}$/;
+// Entity names (e.g. "FIA", "BISP", "Ehsaas Program"): letters, digits, space, _ - . &
+const ENTITY_RE = /^[A-Za-z0-9_\-. &]{1,60}$/;
+
+const listOk = (a, max, re) =>
+  Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && re.test(x));
+
 export async function POST(request) {
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   if (!GEMINI_KEY) return json({ error: 'not_configured' }, 503);
@@ -65,16 +73,19 @@ export async function POST(request) {
   const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
   const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-  // --- UPSTASH NATIVE EDGE RATE LIMITER ---
+  // --- Upstash rate limiter (5 requests / 60s per IP) ---
   if (UPSTASH_URL && UPSTASH_TOKEN) {
     try {
       const rawIp = request.headers.get('x-forwarded-for') || '127.0.0.1';
-      const cleanIp = rawIp.split(',')[0].trim(); 
+      const cleanIp = rawIp.split(',')[0].trim();
       const redisKey = `ratelimit:${cleanIp}`;
-      
-      const response = await fetch(`${UPSTASH_URL}/multi`, {
+
+      const response = await fetch(`${UPSTASH_URL}/multi-exec`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+        headers: {
+          Authorization: `Bearer ${UPSTASH_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
         body: JSON.stringify([
           ['INCR', redisKey],
           ['EXPIRE', redisKey, 60, 'NX']
@@ -82,15 +93,18 @@ export async function POST(request) {
       });
 
       if (response.ok) {
+        // Response shape: [{ result: <INCR value> }, { result: <EXPIRE value> }]
         const result = await response.json();
-        const currentRequests = result && result.result && result.result[0];
-        
+        const currentRequests = Array.isArray(result) && result[0] && result[0].result;
+
         if (typeof currentRequests === 'number' && currentRequests > 5) {
           return json({ error: 'rate_limited' }, 429);
         }
+      } else {
+        console.error('Rate limiter responded with status', response.status);
       }
     } catch (e) {
-      console.error('Rate limiting internal tracer fallback:', e);
+      console.error('Rate limiter error (continuing without it):', e);
     }
   }
 
@@ -98,17 +112,19 @@ export async function POST(request) {
   try {
     body = await request.json();
   } catch (e) {
-    return json({ error: 'bad_request' }, 400);
+    return json({ error: 'bad_request', field: 'json' }, 400);
+  }
+  if (!body || typeof body !== 'object') {
+    return json({ error: 'bad_request', field: 'body' }, 400);
   }
 
-  const lang = body && body.lang === 'ur' ? 'ur' : 'en';
-  const level = body && body.level;
-  
-  // FIX: Completely repaired the validation rule matching regex layout string
-  const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}\$/.test(x));
-  if (!LEVELS.has(level) || !idsOk(body.findings, 25) || !idsOk(body.entities, 10) || typeof body.text !== 'string') {
-    return json({ error: 'bad_request' }, 400);
-  }
+  const lang = body.lang === 'ur' ? 'ur' : 'en';
+  const level = body.level;
+
+  if (!LEVELS.has(level)) return json({ error: 'bad_request', field: 'level' }, 400);
+  if (!listOk(body.findings, 25, FINDING_RE)) return json({ error: 'bad_request', field: 'findings' }, 400);
+  if (!listOk(body.entities, 10, ENTITY_RE)) return json({ error: 'bad_request', field: 'entities' }, 400);
+  if (typeof body.text !== 'string') return json({ error: 'bad_request', field: 'text' }, 400);
 
   const signs = body.findings.filter((id) => RULE_MEANING[id]).map((id) => '- ' + RULE_MEANING[id]);
   const prompt = [
@@ -130,22 +146,28 @@ export async function POST(request) {
 
   let upstream;
   try {
-    upstream = await fetch(`https://googleapis.com{encodeURIComponent(model)}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM }] },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig
-      }),
-      signal: AbortSignal.timeout(15000)
-    });
+    upstream = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM }] },
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig
+        }),
+        signal: AbortSignal.timeout(15000)
+      }
+    );
   } catch (e) {
     return json({ error: 'upstream_unreachable' }, 502);
   }
 
   if (!upstream.ok) {
-    return json({ error: upstream.status === 429 ? 'rate_limited' : 'upstream_error' }, upstream.status === 429 ? 429 : 502);
+    return json(
+      { error: upstream.status === 429 ? 'rate_limited' : 'upstream_error' },
+      upstream.status === 429 ? 429 : 502
+    );
   }
 
   let data;
@@ -155,14 +177,14 @@ export async function POST(request) {
     return json({ error: 'upstream_error' }, 502);
   }
 
-  // FIX: Restored array query reference pointers for Google JSON streams
-  const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+  const parts =
+    data &&
+    data.candidates &&
+    data.candidates[0] &&
+    data.candidates[0].content &&
+    data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
   if (!text) return json({ error: 'empty' }, 502);
 
   return json({ text: text.slice(0, 1500) });
-}
-
-export async function onRequest() {
-  return json({ error: 'method_not_allowed' }, 405);
 }
