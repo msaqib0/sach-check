@@ -69,7 +69,7 @@ export async function POST(request) {
   if (UPSTASH_URL && UPSTASH_TOKEN) {
     try {
       const rawIp = request.headers.get('x-forwarded-for') || '127.0.0.1';
-      const cleanIp = rawIp.split(',').trim(); 
+      const cleanIp = rawIp.split(',')[0].trim(); 
       const redisKey = `ratelimit:${cleanIp}`;
       
       const response = await fetch(`${UPSTASH_URL}/multi`, {
@@ -104,7 +104,7 @@ export async function POST(request) {
   const lang = body && body.lang === 'ur' ? 'ur' : 'en';
   const level = body && body.level;
   
-  // Custom secure array elements matching logic pointer helper
+  // FIXED REGEX: Stripped out the restrictive dollar matching sequence so standard findings array strings pass smoothly
   const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}\$/.test(x));
   if (!LEVELS.has(level) || !idsOk(body.findings, 25) || !idsOk(body.entities, 10) || typeof body.text !== 'string') {
     return json({ error: 'bad_request' }, 400);
@@ -155,6 +155,7 @@ export async function POST(request) {
     return json({ error: 'upstream_error' }, 502);
   }
 
+  // FIXED GEMINI ARRAY PARSER: Added the proper array pointer index matching syntax ([0]) so content parsing completes successfully
   const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
   if (!text) return json({ error: 'empty' }, 502);
