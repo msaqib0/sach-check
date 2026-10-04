@@ -1,9 +1,9 @@
 /**
- * POST /api/explain   (Vercel Edge Serverless Function Runtime)
+ * POST /api/explain   (Vercel Edge Native Serverless Runtime Layout Route)
  */
 
 export const config = {
-  runtime: 'edge', // Forces Vercel to use ultra-fast Edge serverless nodes
+  runtime: 'edge', // Explicitly tells Vercel to host this on their low-latency Edge engine
 };
 
 const LEVELS = new Set(['high', 'suspicious', 'caution', 'none']);
@@ -69,7 +69,7 @@ export async function POST(request) {
   if (UPSTASH_URL && UPSTASH_TOKEN) {
     try {
       const rawIp = request.headers.get('x-forwarded-for') || '127.0.0.1';
-      const cleanIp = rawIp.split(',')[0].trim(); 
+      const cleanIp = rawIp.split(',').trim(); 
       const redisKey = `ratelimit:${cleanIp}`;
       
       const response = await fetch(`${UPSTASH_URL}/multi`, {
@@ -83,7 +83,7 @@ export async function POST(request) {
 
       if (response.ok) {
         const result = await response.json();
-        const currentRequests = result && result[0] && result[0].result;
+        const currentRequests = result && result.result && result.result[0];
         
         if (typeof currentRequests === 'number' && currentRequests > 5) {
           return json({ error: 'rate_limited' }, 429);
@@ -104,7 +104,7 @@ export async function POST(request) {
   const lang = body && body.lang === 'ur' ? 'ur' : 'en';
   const level = body && body.level;
   
-  // FIX: Fixed structural regular expression pattern check
+  // Custom secure array elements matching logic pointer helper
   const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}\$/.test(x));
   if (!LEVELS.has(level) || !idsOk(body.findings, 25) || !idsOk(body.entities, 10) || typeof body.text !== 'string') {
     return json({ error: 'bad_request' }, 400);
@@ -155,7 +155,6 @@ export async function POST(request) {
     return json({ error: 'upstream_error' }, 502);
   }
 
-  // FIX: Fixed array query mapping index matching
   const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
   if (!text) return json({ error: 'empty' }, 502);
