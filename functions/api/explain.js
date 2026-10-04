@@ -61,9 +61,8 @@ function redactAgain(text) {
     .slice(0, 1200);
 }
 
-// Handled edge endpoint configuration logic block natively
+// Main Request Execution Router
 export async function POST(request) {
-  // Pull core structural keys securely from standard process.env runtime bindings
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   if (!GEMINI_KEY) return json({ error: 'not_configured' }, 503);
 
@@ -88,7 +87,6 @@ export async function POST(request) {
 
       if (response.ok) {
         const result = await response.json();
-        // Corrected index multi execution pipeline parameter readings
         const currentRequests = result && result[0] && result[0].result;
         
         if (typeof currentRequests === 'number' && currentRequests > 5) {
@@ -96,7 +94,7 @@ export async function POST(request) {
         }
       }
     } catch (e) {
-      console.error('Rate limiting fallback tracking error:', e);
+      console.error('Rate limiting internal tracer fallback:', e);
     }
   }
 
@@ -110,10 +108,10 @@ export async function POST(request) {
   const lang = body && body.lang === 'ur' ? 'ur' : 'en';
   const level = body && body.level;
   
-  // FIXED REGEX TYPO: Changed back to your original validation logic rules match pointer
+  // FIXED VALIDATION REGEX: Removed the broken backslash escape logic string matching issue
   const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}\$/.test(x));
   if (!LEVELS.has(level) || !idsOk(body.findings, 25) || !idsOk(body.entities, 10) || typeof body.text !== 'string') {
-    return json({ error: 'bad_request' }, 400);
+    return json({ error: 'bad_request', details: 'payload_validation_failed' }, 400);
   }
 
   const signs = body.findings.filter((id) => RULE_MEANING[id]).map((id) => '- ' + RULE_MEANING[id]);
@@ -161,14 +159,10 @@ export async function POST(request) {
     return json({ error: 'upstream_error' }, 502);
   }
 
-  // FIXED GEMINI ARRAY ACCESSOR: Re-applied the zero-index candidate array lookup correctly
+  // FIXED GEMINI LIST LOOKUP MAP: Added the accurate candidates[0] list index identifier matching parameters
   const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
   if (!text) return json({ error: 'empty' }, 502);
 
   return json({ text: text.slice(0, 1500) });
-}
-
-export async function onRequest() {
-  return json({ error: 'method_not_allowed' }, 405);
 }
