@@ -1,5 +1,9 @@
 /**
  * POST /api/explain   (Vercel Edge Function)
+ * AI provider: Groq (free tier, OpenAI-compatible API)
+ *
+ * Required env var:  GROQ_API_KEY
+ * Optional env vars: GROQ_MODEL, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
  */
 
 export const config = {
@@ -8,15 +12,13 @@ export const config = {
 
 const LEVELS = new Set(['high', 'suspicious', 'caution', 'none']);
 
-// Models are tried in this order. If Google answers 404 (model retired or not
-// available for your key), the next one is tried automatically.
-// Optionally set GEMINI_MODEL in Vercel to force a model to be tried first.
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+// Tried in order. If a model is missing/retired (404/400 model error) or errors (5xx),
+// the next one is tried. Set GROQ_MODEL in Vercel to force a model first.
 const MODEL_FALLBACKS = [
-  'gemini-3.1-flash-lite',
-  'gemini-3-flash-preview',
-  'gemini-flash-latest',
-  'gemini-flash-lite-latest',
-  'gemini-2.5-flash'
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant'
 ];
 
 const RULE_MEANING = {
@@ -80,43 +82,54 @@ const listOk = (a, max, re) =>
 // Env vars pasted into dashboards often carry stray spaces, newlines or quotes.
 const cleanEnv = (v) => String(v || '').trim().replace(/^["']+|["']+$/g, '').trim();
 
-// Calls one model. Returns { ok, status, data } or { ok:false, status:0 } on network failure.
-async function callGemini(model, apiKey, prompt) {
-  const generationConfig = { temperature: 0.2, maxOutputTokens: 2048 };
-  if (model.includes('2.5')) generationConfig.thinkingConfig = { thinkingBudget: 0 };
-
+// Calls one Groq model. Returns { ok, status, text }.
+async function callGroq(model, apiKey, prompt) {
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM }] },
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig
-        }),
-        signal: AbortSignal.timeout(15000)
-      }
-    );
+    const res = await fetch(GROQ_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.2,
+        max_tokens: 700
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
-      console.error(`Gemini error [${model}]`, res.status, errText.slice(0, 400));
-      return { ok: false, status: res.status };
+      console.error(`Groq error [${model}]`, res.status, errText.slice(0, 400));
+      return { ok: false, status: res.status, text: '' };
     }
 
     const data = await res.json();
-    return { ok: true, status: 200, data };
+    const text =
+      data &&
+      data.choices &&
+      data.choices[0] &&
+      data.choices[0].message &&
+      typeof data.choices[0].message.content === 'string'
+        ? data.choices[0].message.content.trim()
+        : '';
+
+    if (!text) console.error(`Groq empty response [${model}]:`, JSON.stringify(data).slice(0, 400));
+    return { ok: true, status: 200, text };
   } catch (e) {
-    console.error(`Gemini fetch failed [${model}]:`, e && e.name, e && e.message);
-    return { ok: false, status: 0 };
+    console.error(`Groq fetch failed [${model}]:`, e && e.name, e && e.message);
+    return { ok: false, status: 0, text: '' };
   }
 }
 
 export async function POST(request) {
-  const GEMINI_KEY = cleanEnv(process.env.GEMINI_API_KEY);
-  if (!GEMINI_KEY) return json({ error: 'not_configured' }, 503);
+  const GROQ_KEY = cleanEnv(process.env.GROQ_API_KEY);
+  if (!GROQ_KEY) return json({ error: 'not_configured' }, 503);
 
   const UPSTASH_URL = cleanEnv(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, '');
   const UPSTASH_TOKEN = cleanEnv(process.env.UPSTASH_REDIS_REST_TOKEN);
@@ -187,45 +200,32 @@ export async function POST(request) {
     '</message>'
   ].join('\n');
 
-  // Build the list of models to try (optional env override goes first).
-  const forced = cleanEnv(process.env.GEMINI_MODEL);
+  const forced = cleanEnv(process.env.GROQ_MODEL);
   const models = [...new Set([forced, ...MODEL_FALLBACKS].filter(Boolean))];
 
   let lastStatus = 0;
   let sawEmpty = false;
 
   for (const model of models) {
-    const r = await callGemini(model, GEMINI_KEY, prompt);
+    const r = await callGroq(model, GROQ_KEY, prompt);
     lastStatus = r.status;
 
     if (r.ok) {
-      const data = r.data;
-      const parts =
-        data &&
-        data.candidates &&
-        data.candidates[0] &&
-        data.candidates[0].content &&
-        data.candidates[0].content.parts;
-      const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
-
-      if (text) return json({ text: text.slice(0, 1500) });
-
-      console.error(`Gemini empty response [${model}]:`, JSON.stringify(data).slice(0, 400));
+      if (r.text) return json({ text: r.text.slice(0, 1500) });
       sawEmpty = true;
-      continue; // try next model
+      continue;
     }
 
-    // Quota exhausted: other models share the same key quota, so stop here.
-    if (r.status === 429) return json({ error: 'rate_limited' }, 429);
-
-    // Bad/forbidden key: no point trying other models.
-    if (r.status === 400 || r.status === 401 || r.status === 403) {
+    // Quota exhausted: stop (other models on the same key may still work, but
+    // free limits are per model, so try the next one for 429 as well).
+    // Bad key / forbidden: no point trying other models.
+    if (r.status === 401 || r.status === 403) {
       return json({ error: 'upstream_error', status: r.status }, 502);
     }
-
-    // 404 (model missing), 5xx or network error: try the next model.
+    // 400/404 (unknown model), 429, 5xx, network error: try the next model.
   }
 
+  if (lastStatus === 429) return json({ error: 'rate_limited' }, 429);
   if (sawEmpty) return json({ error: 'empty' }, 502);
   return json({ error: 'upstream_error', status: lastStatus }, 502);
 }
