@@ -180,7 +180,19 @@ async function callModel(baseUrl, apiKey, model, prompt) {
 
 export async function POST(request) {
   const API_KEY = cleanEnv(process.env.AI_API_KEY);
-  if (!API_KEY) return json({ error: 'not_configured' }, 503);
+  if (!API_KEY) {
+    // TEMPORARY DIAGNOSTIC: shows names and lengths only, never values. Remove once working.
+    return json(
+      {
+        error: 'not_configured',
+        version: 'openrouter-v1-diag',
+        envNamesSeen: Object.keys(process.env).filter((k) => /^(AI_|GEMINI|GROQ|OPENROUTER|UPSTASH|VERCEL_ENV|VERCEL_URL)/.test(k)),
+        rawLength: String(process.env.AI_API_KEY || '').length,
+        vercelEnv: process.env.VERCEL_ENV || null
+      },
+      503
+    );
+  }
 
   const BASE_URL = (cleanEnv(process.env.AI_BASE_URL) || DEFAULT_BASE_URL).replace(/\/+$/, '');
 
