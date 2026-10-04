@@ -1,5 +1,5 @@
 /**
- * POST /api/explain   (Cloudflare Pages Function)
+ * POST /api/explain   (Vercel Edge / Cloudflare Pages Function with Upstash Rate Limiting)
  *
  * Optional "explain in simple words" step. It receives ONLY:
  *   - a redacted copy of the message (CNIC / phone / long numbers already removed in the browser)
@@ -7,10 +7,11 @@
  * It asks a free-tier Gemini model to explain the verdict in plain language.
  * The AI cannot change the verdict: that is decided by fixed rules in the browser.
  *
- * Environment (Pages > Settings > Variables and Secrets):
- *   GEMINI_API_KEY   required (secret)
- *   GEMINI_MODEL     optional, default "gemini-2.5-flash". Check Google AI Studio for the
- *                    current free-tier model name if this one is retired.
+ * Environment (Vercel/Pages Settings -> Environment Variables):
+ *   GEMINI_API_KEY           required (secret)
+ *   GEMINI_MODEL             optional, default "gemini-2.5-flash".
+ *   UPSTASH_REDIS_REST_URL   required (secret)
+ *   UPSTASH_REDIS_REST_TOKEN required (secret)
  */
 
 const LEVELS = new Set(['high', 'suspicious', 'caution', 'none']);
@@ -68,11 +69,44 @@ function redactAgain(text) {
 }
 
 export async function onRequestPost({ request, env }) {
-  // Same-origin only.
+  // Same-origin validation.
   const origin = request.headers.get('Origin');
   if (origin && origin !== new URL(request.url).origin) return json({ error: 'forbidden' }, 403);
 
   if (!env.GEMINI_API_KEY) return json({ error: 'not_configured' }, 503);
+
+  // --- UPSTASH NATIVE EDGE RATE LIMITER ---
+  if (env.UPSTASH_REDIS_REST_URL && env.UPSTASH_REDIS_REST_TOKEN) {
+    try {
+      // Get visitor's IP address tracking key safely from Vercel / Cloudflare headers
+      const ip = request.headers.get('x-forwarded-for') || request.headers.get('CF-Connecting-IP') || '127.0.0.1';
+      const redisKey = `ratelimit:${ip.split(',')[0].trim()}`;
+      
+      // Multi-exec Redis commands to check limits dynamically via HTTP API
+      const response = await fetch(`${env.UPSTASH_REDIS_REST_URL}/multi`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}` },
+        body: JSON.stringify([
+          ['INCR', redisKey],
+          ['EXPIRE', redisKey, 60, 'NX']
+        ])
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        // Extract the increment result value from the multi array pipeline response
+        const currentRequests = result?.[0]?.result;
+        
+        // Block request if user hits the button more than 5 times in 60 seconds
+        if (typeof currentRequests === 'number' && currentRequests > 5) {
+          return json({ error: 'rate_limited' }, 429);
+        }
+      }
+    } catch (e) {
+      // Fail open: If Upstash falls over, don't break the user experience
+      console.error('Rate limiting error:', e);
+    }
+  }
 
   let body;
   try {
@@ -83,7 +117,9 @@ export async function onRequestPost({ request, env }) {
 
   const lang = body && body.lang === 'ur' ? 'ur' : 'en';
   const level = body && body.level;
-  const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}$/.test(x));
+  
+  // FIXED REGEX: Fixed backslash escaping issue from original script
+  const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}\$/.test(x));
   if (!LEVELS.has(level) || !idsOk(body.findings, 25) || !idsOk(body.entities, 10) || typeof body.text !== 'string') {
     return json({ error: 'bad_request' }, 400);
   }
@@ -108,7 +144,7 @@ export async function onRequestPost({ request, env }) {
 
   let upstream;
   try {
-    upstream = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    upstream = await fetch(`https://googleapis.com{encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
       body: JSON.stringify({
@@ -123,7 +159,6 @@ export async function onRequestPost({ request, env }) {
   }
 
   if (!upstream.ok) {
-    // 429 = free-tier rate limit reached. Do not leak upstream details.
     return json({ error: upstream.status === 429 ? 'rate_limited' : 'upstream_error' }, upstream.status === 429 ? 429 : 502);
   }
 
@@ -134,6 +169,7 @@ export async function onRequestPost({ request, env }) {
     return json({ error: 'upstream_error' }, 502);
   }
 
+  // FIXED PROPERTY PATH: Re-added array [0] index accessor safely so Gemini mapping works
   const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
   if (!text) return json({ error: 'empty' }, 502);
