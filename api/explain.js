@@ -1,16 +1,3 @@
-/**
- * POST /api/explain   (Vercel Edge Function)
- *
- * Works with any OpenAI-compatible provider. Default: OpenRouter (free ":free" models).
- *
- * Env vars
- *   AI_API_KEY     (required)  your provider key
- *   AI_BASE_URL    (optional)  default https://openrouter.ai/api/v1
- *   AI_MODELS      (optional)  comma-separated model IDs, in order of preference.
- *                              If empty on OpenRouter, free models are discovered automatically.
- *   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN  (optional) rate limiting
- */
-
 export const config = {
   runtime: 'edge',
 };
@@ -19,15 +6,16 @@ const LEVELS = new Set(['high', 'suspicious', 'caution', 'none']);
 
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 
-// Used only if AI_MODELS is not set and live discovery on OpenRouter fails.
-const OPENROUTER_FALLBACK_MODELS = [
+const FALLBACK_MODELS = [
   'meta-llama/llama-3.3-70b-instruct:free',
   'openai/gpt-oss-20b:free',
   'google/gemma-3-27b-it:free'
 ];
 
 const MAX_MODELS_TRIED = 3;
-const PER_MODEL_TIMEOUT_MS = 8000;
+const MODEL_TIMEOUT_MS = 8000;
+const RATE_LIMIT_MAX = 5;
+const RATE_LIMIT_WINDOW = 60;
 
 const RULE_MEANING = {
   asks_otp_pin: 'asks the reader to share an OTP, PIN or password',
@@ -65,11 +53,24 @@ Rules you must follow:
 - Write in the requested language. For Urdu, use Urdu script only.
 - Reply with the explanation only. Do not show your reasoning or any notes.`;
 
+const FINDING_RE = /^[a-z_]{1,40}$/;
+const ENTITY_RE = /^[A-Za-z0-9_\-. &]{1,60}$/;
+
+let modelCache = { at: 0, ids: [] };
+
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
   });
+}
+
+function cleanEnv(value) {
+  return String(value || '').trim().replace(/^["']+|["']+$/g, '').trim();
+}
+
+function listOk(arr, max, re) {
+  return Array.isArray(arr) && arr.length <= max && arr.every((x) => typeof x === 'string' && re.test(x));
 }
 
 function redactAgain(text) {
@@ -80,58 +81,73 @@ function redactAgain(text) {
     .slice(0, 1200);
 }
 
-// Rule IDs: lowercase letters and underscores only.
-const FINDING_RE = /^[a-z_]{1,40}$/;
-// Entity names (e.g. "FIA", "BISP", "Ehsaas Program"): letters, digits, space, _ - . &
-const ENTITY_RE = /^[A-Za-z0-9_\-. &]{1,60}$/;
+async function isRateLimited(request, url, token) {
+  if (!url || !token) return false;
 
-const listOk = (a, max, re) =>
-  Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && re.test(x));
+  try {
+    const forwarded = request.headers.get('x-forwarded-for') || '127.0.0.1';
+    const ip = forwarded.split(',')[0].trim();
+    const key = `ratelimit:${ip}`;
 
-// Env vars pasted into dashboards often carry stray spaces, newlines or quotes.
-const cleanEnv = (v) => String(v || '').trim().replace(/^["']+|["']+$/g, '').trim();
+    const res = await fetch(`${url}/multi-exec`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify([
+        ['INCR', key],
+        ['EXPIRE', key, RATE_LIMIT_WINDOW, 'NX']
+      ])
+    });
 
-// ---- Model discovery (OpenRouter only), cached in memory for 10 minutes ----
-let discoveryCache = { at: 0, models: [] };
+    if (!res.ok) {
+      console.error('Rate limiter status', res.status);
+      return false;
+    }
 
-async function discoverOpenRouterFreeModels(baseUrl, apiKey) {
-  const now = Date.now();
-  if (discoveryCache.models.length && now - discoveryCache.at < 10 * 60 * 1000) {
-    return discoveryCache.models;
+    const result = await res.json();
+    const count = Array.isArray(result) && result[0] && result[0].result;
+    return typeof count === 'number' && count > RATE_LIMIT_MAX;
+  } catch (e) {
+    console.error('Rate limiter error:', e && e.message);
+    return false;
   }
+}
+
+async function findFreeModels(baseUrl, apiKey) {
+  const now = Date.now();
+  if (modelCache.ids.length && now - modelCache.at < 10 * 60 * 1000) {
+    return modelCache.ids;
+  }
+
   try {
     const res = await fetch(`${baseUrl}/models`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(5000)
     });
-    if (!res.ok) {
-      console.error('Model discovery failed with status', res.status);
-      return [];
-    }
+    if (!res.ok) return [];
+
     const data = await res.json();
     const list = Array.isArray(data && data.data) ? data.data : [];
+    const preferred = /llama|gemma|qwen|mistral|gpt-oss|deepseek|glm|nemotron/i;
 
     const free = list
       .filter((m) => m && typeof m.id === 'string' && m.id.endsWith(':free'))
       .filter((m) => !/vision|image|audio|embed|guard|tts|whisper|moderation|vl\b/i.test(m.id))
-      .filter((m) => !m.context_length || m.context_length >= 4000);
-
-    // Prefer well-known general chat families first.
-    const preferred = /llama|gemma|qwen|mistral|gpt-oss|deepseek|glm|nemotron/i;
-    free.sort((a, b) => Number(preferred.test(b.id)) - Number(preferred.test(a.id)));
+      .filter((m) => !m.context_length || m.context_length >= 4000)
+      .sort((a, b) => Number(preferred.test(b.id)) - Number(preferred.test(a.id)));
 
     const ids = free.map((m) => m.id);
-    if (ids.length) discoveryCache = { at: now, models: ids };
+    if (ids.length) modelCache = { at: now, ids };
     return ids;
   } catch (e) {
-    console.error('Model discovery error:', e && e.name, e && e.message);
+    console.error('Model lookup failed:', e && e.message);
     return [];
   }
 }
 
-// Calls one model. Returns { ok, status, text }.
-async function callModel(baseUrl, apiKey, model, prompt) {
-  // Some models (e.g. Gemma) reject a separate system role, so merge it in.
+async function askModel(baseUrl, apiKey, model, prompt) {
   const mergeSystem = /gemma/i.test(model);
   const messages = mergeSystem
     ? [{ role: 'user', content: `${SYSTEM}\n\n${prompt}` }]
@@ -155,101 +171,58 @@ async function callModel(baseUrl, apiKey, model, prompt) {
         temperature: 0.2,
         max_tokens: 1000
       }),
-      signal: AbortSignal.timeout(PER_MODEL_TIMEOUT_MS)
+      signal: AbortSignal.timeout(MODEL_TIMEOUT_MS)
     });
 
     if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      console.error(`AI error [${model}]`, res.status, errText.slice(0, 400));
+      const detail = await res.text().catch(() => '');
+      console.error(`Model error [${model}]`, res.status, detail.slice(0, 300));
       return { ok: false, status: res.status, text: '' };
     }
 
     const data = await res.json();
-    const msg = data && data.choices && data.choices[0] && data.choices[0].message;
-    let text = msg && typeof msg.content === 'string' ? msg.content : '';
-    // Strip any <think>...</think> reasoning some models leak into the answer.
-    text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    const message = data && data.choices && data.choices[0] && data.choices[0].message;
+    const raw = message && typeof message.content === 'string' ? message.content : '';
+    const text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
-    if (!text) console.error(`AI empty response [${model}]:`, JSON.stringify(data).slice(0, 400));
     return { ok: true, status: 200, text };
   } catch (e) {
-    console.error(`AI fetch failed [${model}]:`, e && e.name, e && e.message);
+    console.error(`Model request failed [${model}]:`, e && e.message);
     return { ok: false, status: 0, text: '' };
   }
 }
 
 export async function POST(request) {
-  const API_KEY = cleanEnv(process.env.AI_API_KEY);
-  if (!API_KEY) {
-    // TEMPORARY DIAGNOSTIC: shows names and lengths only, never values. Remove once working.
-    return json(
-      {
-        error: 'not_configured',
-        version: 'openrouter-v1-diag',
-        envNamesSeen: Object.keys(process.env).filter((k) => /^(AI_|GEMINI|GROQ|OPENROUTER|UPSTASH|VERCEL_ENV|VERCEL_URL)/.test(k)),
-        rawLength: String(process.env.AI_API_KEY || '').length,
-        vercelEnv: process.env.VERCEL_ENV || null
-      },
-      503
-    );
-  }
+  const apiKey = cleanEnv(process.env.AI_API_KEY);
+  if (!apiKey) return json({ error: 'not_configured' }, 503);
 
-  const BASE_URL = (cleanEnv(process.env.AI_BASE_URL) || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const baseUrl = (cleanEnv(process.env.AI_BASE_URL) || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const upstashUrl = cleanEnv(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, '');
+  const upstashToken = cleanEnv(process.env.UPSTASH_REDIS_REST_TOKEN);
 
-  const UPSTASH_URL = cleanEnv(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, '');
-  const UPSTASH_TOKEN = cleanEnv(process.env.UPSTASH_REDIS_REST_TOKEN);
-
-  // --- Upstash rate limiter (5 requests / 60s per IP) ---
-  if (UPSTASH_URL && UPSTASH_TOKEN) {
-    try {
-      const rawIp = request.headers.get('x-forwarded-for') || '127.0.0.1';
-      const cleanIp = rawIp.split(',')[0].trim();
-      const redisKey = `ratelimit:${cleanIp}`;
-
-      const response = await fetch(`${UPSTASH_URL}/multi-exec`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${UPSTASH_TOKEN}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify([
-          ['INCR', redisKey],
-          ['EXPIRE', redisKey, 60, 'NX']
-        ])
-      });
-
-      if (response.ok) {
-        const result = await response.json();
-        const currentRequests = Array.isArray(result) && result[0] && result[0].result;
-
-        if (typeof currentRequests === 'number' && currentRequests > 5) {
-          return json({ error: 'rate_limited' }, 429);
-        }
-      } else {
-        console.error('Rate limiter responded with status', response.status);
-      }
-    } catch (e) {
-      console.error('Rate limiter error (continuing without it):', e && e.name, e && e.message);
-    }
+  if (await isRateLimited(request, upstashUrl, upstashToken)) {
+    return json({ error: 'rate_limited' }, 429);
   }
 
   let body;
   try {
     body = await request.json();
   } catch (e) {
-    return json({ error: 'bad_request', field: 'json' }, 400);
+    return json({ error: 'bad_request' }, 400);
   }
-  if (!body || typeof body !== 'object') {
-    return json({ error: 'bad_request', field: 'body' }, 400);
-  }
+  if (!body || typeof body !== 'object') return json({ error: 'bad_request' }, 400);
 
   const lang = body.lang === 'ur' ? 'ur' : 'en';
   const level = body.level;
 
-  if (!LEVELS.has(level)) return json({ error: 'bad_request', field: 'level' }, 400);
-  if (!listOk(body.findings, 25, FINDING_RE)) return json({ error: 'bad_request', field: 'findings' }, 400);
-  if (!listOk(body.entities, 10, ENTITY_RE)) return json({ error: 'bad_request', field: 'entities' }, 400);
-  if (typeof body.text !== 'string') return json({ error: 'bad_request', field: 'text' }, 400);
+  if (
+    !LEVELS.has(level) ||
+    !listOk(body.findings, 25, FINDING_RE) ||
+    !listOk(body.entities, 10, ENTITY_RE) ||
+    typeof body.text !== 'string'
+  ) {
+    return json({ error: 'bad_request' }, 400);
+  }
 
   const signs = body.findings.filter((id) => RULE_MEANING[id]).map((id) => '- ' + RULE_MEANING[id]);
   const prompt = [
@@ -265,44 +238,36 @@ export async function POST(request) {
     '</message>'
   ].join('\n');
 
-  // Work out which models to try.
   let models = cleanEnv(process.env.AI_MODELS)
     .split(',')
     .map((m) => m.trim())
     .filter(Boolean);
 
-  const isOpenRouter = BASE_URL.includes('openrouter.ai');
-  if (!models.length && isOpenRouter) {
-    models = await discoverOpenRouterFreeModels(BASE_URL, API_KEY);
-    if (!models.length) models = OPENROUTER_FALLBACK_MODELS;
+  if (!models.length && baseUrl.includes('openrouter.ai')) {
+    models = await findFreeModels(baseUrl, apiKey);
+    if (!models.length) models = FALLBACK_MODELS;
   }
-  if (!models.length) {
-    console.error('No models configured. Set AI_MODELS in Vercel env vars.');
-    return json({ error: 'not_configured', field: 'AI_MODELS' }, 503);
-  }
-  models = models.slice(0, MAX_MODELS_TRIED);
+  if (!models.length) return json({ error: 'not_configured' }, 503);
 
   let lastStatus = 0;
-  let sawEmpty = false;
+  let gotEmpty = false;
 
-  for (const model of models) {
-    const r = await callModel(BASE_URL, API_KEY, model, prompt);
-    lastStatus = r.status;
+  for (const model of models.slice(0, MAX_MODELS_TRIED)) {
+    const result = await askModel(baseUrl, apiKey, model, prompt);
+    lastStatus = result.status;
 
-    if (r.ok) {
-      if (r.text) return json({ text: r.text.slice(0, 1500) });
-      sawEmpty = true;
+    if (result.ok) {
+      if (result.text) return json({ text: result.text.slice(0, 1500) });
+      gotEmpty = true;
       continue;
     }
 
-    // Bad or forbidden key: other models will not help.
-    if (r.status === 401 || r.status === 403) {
-      return json({ error: 'upstream_error', status: r.status }, 502);
+    if (result.status === 401 || result.status === 403) {
+      return json({ error: 'upstream_error' }, 502);
     }
-    // 400/404 (bad model), 402, 429, 5xx, timeout: try the next model.
   }
 
   if (lastStatus === 429) return json({ error: 'rate_limited' }, 429);
-  if (sawEmpty) return json({ error: 'empty' }, 502);
-  return json({ error: 'upstream_error', status: lastStatus }, 502);
+  if (gotEmpty) return json({ error: 'empty' }, 502);
+  return json({ error: 'upstream_error' }, 502);
 }
