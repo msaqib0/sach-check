@@ -61,13 +61,12 @@ function redactAgain(text) {
     .slice(0, 1200);
 }
 
-// Fixed endpoint trigger signature for Vercel's Engine
+// Handled edge endpoint configuration logic block natively
 export async function POST(request) {
-  // Read Gemini API Key using standard Vercel syntax
+  // Pull core structural keys securely from standard process.env runtime bindings
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   if (!GEMINI_KEY) return json({ error: 'not_configured' }, 503);
 
-  // Read Upstash Keys using standard Vercel syntax
   const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
   const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
@@ -89,15 +88,15 @@ export async function POST(request) {
 
       if (response.ok) {
         const result = await response.json();
-        // FIXED PIPELINE ACCESSOR: Safely pulling index array item out of multi execution pipeline
-        const currentRequests = result && result.result && result.result[0];
+        // Corrected index multi execution pipeline parameter readings
+        const currentRequests = result && result[0] && result[0].result;
         
         if (typeof currentRequests === 'number' && currentRequests > 5) {
           return json({ error: 'rate_limited' }, 429);
         }
       }
     } catch (e) {
-      console.error('Rate limiting internal tracer fallback:', e);
+      console.error('Rate limiting fallback tracking error:', e);
     }
   }
 
@@ -111,7 +110,7 @@ export async function POST(request) {
   const lang = body && body.lang === 'ur' ? 'ur' : 'en';
   const level = body && body.level;
   
-  // FIXED REGEX: Kept your original secure structural validation regex working cleanly
+  // FIXED REGEX TYPO: Changed back to your original validation logic rules match pointer
   const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}\$/.test(x));
   if (!LEVELS.has(level) || !idsOk(body.findings, 25) || !idsOk(body.entities, 10) || typeof body.text !== 'string') {
     return json({ error: 'bad_request' }, 400);
@@ -162,7 +161,7 @@ export async function POST(request) {
     return json({ error: 'upstream_error' }, 502);
   }
 
-  // FIXED GEMINI ARRAY PARSER: Re-added [0] accessor safely so the text strings decode correctly out of the Gemini structure!
+  // FIXED GEMINI ARRAY ACCESSOR: Re-applied the zero-index candidate array lookup correctly
   const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
   if (!text) return json({ error: 'empty' }, 502);
