@@ -8,6 +8,17 @@ export const config = {
 
 const LEVELS = new Set(['high', 'suspicious', 'caution', 'none']);
 
+// Models are tried in this order. If Google answers 404 (model retired or not
+// available for your key), the next one is tried automatically.
+// Optionally set GEMINI_MODEL in Vercel to force a model to be tried first.
+const MODEL_FALLBACKS = [
+  'gemini-3.1-flash-lite',
+  'gemini-3-flash-preview',
+  'gemini-flash-latest',
+  'gemini-flash-lite-latest',
+  'gemini-2.5-flash'
+];
+
 const RULE_MEANING = {
   asks_otp_pin: 'asks the reader to share an OTP, PIN or password',
   asks_cnic: 'asks the reader to send their CNIC / ID details',
@@ -67,8 +78,41 @@ const listOk = (a, max, re) =>
   Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && re.test(x));
 
 // Env vars pasted into dashboards often carry stray spaces, newlines or quotes.
-// Any of these makes fetch() throw "Invalid header value" before sending anything.
 const cleanEnv = (v) => String(v || '').trim().replace(/^["']+|["']+$/g, '').trim();
+
+// Calls one model. Returns { ok, status, data } or { ok:false, status:0 } on network failure.
+async function callGemini(model, apiKey, prompt) {
+  const generationConfig = { temperature: 0.2, maxOutputTokens: 2048 };
+  if (model.includes('2.5')) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM }] },
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig
+        }),
+        signal: AbortSignal.timeout(15000)
+      }
+    );
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.error(`Gemini error [${model}]`, res.status, errText.slice(0, 400));
+      return { ok: false, status: res.status };
+    }
+
+    const data = await res.json();
+    return { ok: true, status: 200, data };
+  } catch (e) {
+    console.error(`Gemini fetch failed [${model}]:`, e && e.name, e && e.message);
+    return { ok: false, status: 0 };
+  }
+}
 
 export async function POST(request) {
   const GEMINI_KEY = cleanEnv(process.env.GEMINI_API_KEY);
@@ -97,7 +141,6 @@ export async function POST(request) {
       });
 
       if (response.ok) {
-        // Response shape: [{ result: <INCR value> }, { result: <EXPIRE value> }]
         const result = await response.json();
         const currentRequests = Array.isArray(result) && result[0] && result[0].result;
 
@@ -144,59 +187,45 @@ export async function POST(request) {
     '</message>'
   ].join('\n');
 
-  const model = cleanEnv(process.env.GEMINI_MODEL) || 'gemini-2.5-flash';
-  // Urdu uses many tokens, so allow plenty of room.
-  const generationConfig = { temperature: 0.2, maxOutputTokens: 1200 };
-  if (model.includes('2.5')) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  // Build the list of models to try (optional env override goes first).
+  const forced = cleanEnv(process.env.GEMINI_MODEL);
+  const models = [...new Set([forced, ...MODEL_FALLBACKS].filter(Boolean))];
 
-  let upstream;
-  try {
-    upstream = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM }] },
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig
-        }),
-        signal: AbortSignal.timeout(15000)
-      }
-    );
-  } catch (e) {
-    console.error('Gemini fetch failed:', e && e.name, e && e.message);
-    return json({ error: 'upstream_unreachable' }, 502);
+  let lastStatus = 0;
+  let sawEmpty = false;
+
+  for (const model of models) {
+    const r = await callGemini(model, GEMINI_KEY, prompt);
+    lastStatus = r.status;
+
+    if (r.ok) {
+      const data = r.data;
+      const parts =
+        data &&
+        data.candidates &&
+        data.candidates[0] &&
+        data.candidates[0].content &&
+        data.candidates[0].content.parts;
+      const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
+
+      if (text) return json({ text: text.slice(0, 1500) });
+
+      console.error(`Gemini empty response [${model}]:`, JSON.stringify(data).slice(0, 400));
+      sawEmpty = true;
+      continue; // try next model
+    }
+
+    // Quota exhausted: other models share the same key quota, so stop here.
+    if (r.status === 429) return json({ error: 'rate_limited' }, 429);
+
+    // Bad/forbidden key: no point trying other models.
+    if (r.status === 400 || r.status === 401 || r.status === 403) {
+      return json({ error: 'upstream_error', status: r.status }, 502);
+    }
+
+    // 404 (model missing), 5xx or network error: try the next model.
   }
 
-  if (!upstream.ok) {
-    const errText = await upstream.text().catch(() => '');
-    console.error('Gemini error', upstream.status, errText.slice(0, 500));
-    return json(
-      { error: upstream.status === 429 ? 'rate_limited' : 'upstream_error', status: upstream.status },
-      upstream.status === 429 ? 429 : 502
-    );
-  }
-
-  let data;
-  try {
-    data = await upstream.json();
-  } catch (e) {
-    console.error('Gemini returned invalid JSON:', e && e.message);
-    return json({ error: 'upstream_error' }, 502);
-  }
-
-  const parts =
-    data &&
-    data.candidates &&
-    data.candidates[0] &&
-    data.candidates[0].content &&
-    data.candidates[0].content.parts;
-  const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
-  if (!text) {
-    console.error('Gemini empty response:', JSON.stringify(data).slice(0, 500));
-    return json({ error: 'empty' }, 502);
-  }
-
-  return json({ text: text.slice(0, 1500) });
+  if (sawEmpty) return json({ error: 'empty' }, 502);
+  return json({ error: 'upstream_error', status: lastStatus }, 502);
 }
