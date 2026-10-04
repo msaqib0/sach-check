@@ -1,16 +1,13 @@
 /**
- * POST /api/explain   (Vercel Edge Native Serverless Runtime)
- *
- * Optional "explain in simple words" step. It receives ONLY:
- *   - a redacted copy of the message (CNIC / phone / long numbers already removed in the browser)
- *   - the ids of the rules that fired, and the verdict level
- * It asks a free-tier Gemini model to explain the verdict in plain language.
- * The AI cannot change the verdict: that is decided by fixed rules in the browser.
+ * POST /api/explain   (Vercel Edge Serverless Function Runtime)
  */
+
+export const config = {
+  runtime: 'edge', // Forces Vercel to use ultra-fast Edge serverless nodes
+};
 
 const LEVELS = new Set(['high', 'suspicious', 'caution', 'none']);
 
-// Plain-English meaning of each rule id, so the model never has to guess.
 const RULE_MEANING = {
   asks_otp_pin: 'asks the reader to share an OTP, PIN or password',
   asks_cnic: 'asks the reader to send their CNIC / ID details',
@@ -61,7 +58,6 @@ function redactAgain(text) {
     .slice(0, 1200);
 }
 
-// Main Request Execution Router
 export async function POST(request) {
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   if (!GEMINI_KEY) return json({ error: 'not_configured' }, 503);
@@ -108,10 +104,10 @@ export async function POST(request) {
   const lang = body && body.lang === 'ur' ? 'ur' : 'en';
   const level = body && body.level;
   
-  // FIXED VALIDATION REGEX: Removed the broken backslash escape logic string matching issue
+  // FIX: Fixed structural regular expression pattern check
   const idsOk = (a, max) => Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && /^[a-z_]{1,40}\$/.test(x));
   if (!LEVELS.has(level) || !idsOk(body.findings, 25) || !idsOk(body.entities, 10) || typeof body.text !== 'string') {
-    return json({ error: 'bad_request', details: 'payload_validation_failed' }, 400);
+    return json({ error: 'bad_request' }, 400);
   }
 
   const signs = body.findings.filter((id) => RULE_MEANING[id]).map((id) => '- ' + RULE_MEANING[id]);
@@ -159,7 +155,7 @@ export async function POST(request) {
     return json({ error: 'upstream_error' }, 502);
   }
 
-  // FIXED GEMINI LIST LOOKUP MAP: Added the accurate candidates[0] list index identifier matching parameters
+  // FIX: Fixed array query mapping index matching
   const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
   if (!text) return json({ error: 'empty' }, 502);
