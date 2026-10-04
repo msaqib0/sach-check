@@ -1,9 +1,14 @@
 /**
  * POST /api/explain   (Vercel Edge Function)
- * AI provider: Groq (free tier, OpenAI-compatible API)
  *
- * Required env var:  GROQ_API_KEY
- * Optional env vars: GROQ_MODEL, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
+ * Works with any OpenAI-compatible provider. Default: OpenRouter (free ":free" models).
+ *
+ * Env vars
+ *   AI_API_KEY     (required)  your provider key
+ *   AI_BASE_URL    (optional)  default https://openrouter.ai/api/v1
+ *   AI_MODELS      (optional)  comma-separated model IDs, in order of preference.
+ *                              If empty on OpenRouter, free models are discovered automatically.
+ *   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN  (optional) rate limiting
  */
 
 export const config = {
@@ -12,14 +17,17 @@ export const config = {
 
 const LEVELS = new Set(['high', 'suspicious', 'caution', 'none']);
 
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 
-// Tried in order. If a model is missing/retired (404/400 model error) or errors (5xx),
-// the next one is tried. Set GROQ_MODEL in Vercel to force a model first.
-const MODEL_FALLBACKS = [
-  'llama-3.3-70b-versatile',
-  'llama-3.1-8b-instant'
+// Used only if AI_MODELS is not set and live discovery on OpenRouter fails.
+const OPENROUTER_FALLBACK_MODELS = [
+  'meta-llama/llama-3.3-70b-instruct:free',
+  'openai/gpt-oss-20b:free',
+  'google/gemma-3-27b-it:free'
 ];
+
+const MAX_MODELS_TRIED = 3;
+const PER_MODEL_TIMEOUT_MS = 8000;
 
 const RULE_MEANING = {
   asks_otp_pin: 'asks the reader to share an OTP, PIN or password',
@@ -54,7 +62,8 @@ Rules you must follow:
 - Never say a message is "safe" or "genuine". If the verdict is "none", say no known warning signs were found but that this does not prove it is genuine and they should confirm through the official channel.
 - Never ask the reader for personal information.
 - Write 3 to 5 short sentences, in very simple words, for someone with little technical knowledge.
-- Write in the requested language. For Urdu, use Urdu script only.`;
+- Write in the requested language. For Urdu, use Urdu script only.
+- Reply with the explanation only. Do not show your reasoning or any notes.`;
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -82,54 +91,98 @@ const listOk = (a, max, re) =>
 // Env vars pasted into dashboards often carry stray spaces, newlines or quotes.
 const cleanEnv = (v) => String(v || '').trim().replace(/^["']+|["']+$/g, '').trim();
 
-// Calls one Groq model. Returns { ok, status, text }.
-async function callGroq(model, apiKey, prompt) {
+// ---- Model discovery (OpenRouter only), cached in memory for 10 minutes ----
+let discoveryCache = { at: 0, models: [] };
+
+async function discoverOpenRouterFreeModels(baseUrl, apiKey) {
+  const now = Date.now();
+  if (discoveryCache.models.length && now - discoveryCache.at < 10 * 60 * 1000) {
+    return discoveryCache.models;
+  }
   try {
-    const res = await fetch(GROQ_URL, {
+    const res = await fetch(`${baseUrl}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!res.ok) {
+      console.error('Model discovery failed with status', res.status);
+      return [];
+    }
+    const data = await res.json();
+    const list = Array.isArray(data && data.data) ? data.data : [];
+
+    const free = list
+      .filter((m) => m && typeof m.id === 'string' && m.id.endsWith(':free'))
+      .filter((m) => !/vision|image|audio|embed|guard|tts|whisper|moderation|vl\b/i.test(m.id))
+      .filter((m) => !m.context_length || m.context_length >= 4000);
+
+    // Prefer well-known general chat families first.
+    const preferred = /llama|gemma|qwen|mistral|gpt-oss|deepseek|glm|nemotron/i;
+    free.sort((a, b) => Number(preferred.test(b.id)) - Number(preferred.test(a.id)));
+
+    const ids = free.map((m) => m.id);
+    if (ids.length) discoveryCache = { at: now, models: ids };
+    return ids;
+  } catch (e) {
+    console.error('Model discovery error:', e && e.name, e && e.message);
+    return [];
+  }
+}
+
+// Calls one model. Returns { ok, status, text }.
+async function callModel(baseUrl, apiKey, model, prompt) {
+  // Some models (e.g. Gemma) reject a separate system role, so merge it in.
+  const mergeSystem = /gemma/i.test(model);
+  const messages = mergeSystem
+    ? [{ role: 'user', content: `${SYSTEM}\n\n${prompt}` }]
+    : [
+        { role: 'system', content: SYSTEM },
+        { role: 'user', content: prompt }
+      ];
+
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`
+        Authorization: `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://sachcheck-pk.vercel.app',
+        'X-Title': 'SachCheck PK'
       },
       body: JSON.stringify({
         model,
-        messages: [
-          { role: 'system', content: SYSTEM },
-          { role: 'user', content: prompt }
-        ],
+        messages,
         temperature: 0.2,
-        max_tokens: 700
+        max_tokens: 1000
       }),
-      signal: AbortSignal.timeout(15000)
+      signal: AbortSignal.timeout(PER_MODEL_TIMEOUT_MS)
     });
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
-      console.error(`Groq error [${model}]`, res.status, errText.slice(0, 400));
+      console.error(`AI error [${model}]`, res.status, errText.slice(0, 400));
       return { ok: false, status: res.status, text: '' };
     }
 
     const data = await res.json();
-    const text =
-      data &&
-      data.choices &&
-      data.choices[0] &&
-      data.choices[0].message &&
-      typeof data.choices[0].message.content === 'string'
-        ? data.choices[0].message.content.trim()
-        : '';
+    const msg = data && data.choices && data.choices[0] && data.choices[0].message;
+    let text = msg && typeof msg.content === 'string' ? msg.content : '';
+    // Strip any <think>...</think> reasoning some models leak into the answer.
+    text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
-    if (!text) console.error(`Groq empty response [${model}]:`, JSON.stringify(data).slice(0, 400));
+    if (!text) console.error(`AI empty response [${model}]:`, JSON.stringify(data).slice(0, 400));
     return { ok: true, status: 200, text };
   } catch (e) {
-    console.error(`Groq fetch failed [${model}]:`, e && e.name, e && e.message);
+    console.error(`AI fetch failed [${model}]:`, e && e.name, e && e.message);
     return { ok: false, status: 0, text: '' };
   }
 }
 
 export async function POST(request) {
-  const GROQ_KEY = cleanEnv(process.env.GROQ_API_KEY);
-  if (!GROQ_KEY) return json({ error: 'not_configured' }, 503);
+  const API_KEY = cleanEnv(process.env.AI_API_KEY);
+  if (!API_KEY) return json({ error: 'not_configured' }, 503);
+
+  const BASE_URL = (cleanEnv(process.env.AI_BASE_URL) || DEFAULT_BASE_URL).replace(/\/+$/, '');
 
   const UPSTASH_URL = cleanEnv(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, '');
   const UPSTASH_TOKEN = cleanEnv(process.env.UPSTASH_REDIS_REST_TOKEN);
@@ -200,14 +253,28 @@ export async function POST(request) {
     '</message>'
   ].join('\n');
 
-  const forced = cleanEnv(process.env.GROQ_MODEL);
-  const models = [...new Set([forced, ...MODEL_FALLBACKS].filter(Boolean))];
+  // Work out which models to try.
+  let models = cleanEnv(process.env.AI_MODELS)
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean);
+
+  const isOpenRouter = BASE_URL.includes('openrouter.ai');
+  if (!models.length && isOpenRouter) {
+    models = await discoverOpenRouterFreeModels(BASE_URL, API_KEY);
+    if (!models.length) models = OPENROUTER_FALLBACK_MODELS;
+  }
+  if (!models.length) {
+    console.error('No models configured. Set AI_MODELS in Vercel env vars.');
+    return json({ error: 'not_configured', field: 'AI_MODELS' }, 503);
+  }
+  models = models.slice(0, MAX_MODELS_TRIED);
 
   let lastStatus = 0;
   let sawEmpty = false;
 
   for (const model of models) {
-    const r = await callGroq(model, GROQ_KEY, prompt);
+    const r = await callModel(BASE_URL, API_KEY, model, prompt);
     lastStatus = r.status;
 
     if (r.ok) {
@@ -216,13 +283,11 @@ export async function POST(request) {
       continue;
     }
 
-    // Quota exhausted: stop (other models on the same key may still work, but
-    // free limits are per model, so try the next one for 429 as well).
-    // Bad key / forbidden: no point trying other models.
+    // Bad or forbidden key: other models will not help.
     if (r.status === 401 || r.status === 403) {
       return json({ error: 'upstream_error', status: r.status }, 502);
     }
-    // 400/404 (unknown model), 429, 5xx, network error: try the next model.
+    // 400/404 (bad model), 402, 429, 5xx, timeout: try the next model.
   }
 
   if (lastStatus === 429) return json({ error: 'rate_limited' }, 429);
