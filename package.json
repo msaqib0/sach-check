@@ -1,0 +1,13 @@
+{
+  "name": "sach-check",
+  "version": "1.0.0",
+  "description": "Check suspicious Pakistani SMS/WhatsApp messages against known scam patterns and official channels. Free, browser-side.",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "dev": "wrangler pages dev public --compatibility-date=2025-09-01"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
