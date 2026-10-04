@@ -66,12 +66,16 @@ const ENTITY_RE = /^[A-Za-z0-9_\-. &]{1,60}$/;
 const listOk = (a, max, re) =>
   Array.isArray(a) && a.length <= max && a.every((x) => typeof x === 'string' && re.test(x));
 
+// Env vars pasted into dashboards often carry stray spaces, newlines or quotes.
+// Any of these makes fetch() throw "Invalid header value" before sending anything.
+const cleanEnv = (v) => String(v || '').trim().replace(/^["']+|["']+$/g, '').trim();
+
 export async function POST(request) {
-  const GEMINI_KEY = process.env.GEMINI_API_KEY;
+  const GEMINI_KEY = cleanEnv(process.env.GEMINI_API_KEY);
   if (!GEMINI_KEY) return json({ error: 'not_configured' }, 503);
 
-  const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
-  const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+  const UPSTASH_URL = cleanEnv(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, '');
+  const UPSTASH_TOKEN = cleanEnv(process.env.UPSTASH_REDIS_REST_TOKEN);
 
   // --- Upstash rate limiter (5 requests / 60s per IP) ---
   if (UPSTASH_URL && UPSTASH_TOKEN) {
@@ -104,7 +108,7 @@ export async function POST(request) {
         console.error('Rate limiter responded with status', response.status);
       }
     } catch (e) {
-      console.error('Rate limiter error (continuing without it):', e);
+      console.error('Rate limiter error (continuing without it):', e && e.name, e && e.message);
     }
   }
 
@@ -140,8 +144,9 @@ export async function POST(request) {
     '</message>'
   ].join('\n');
 
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-  const generationConfig = { temperature: 0.2, maxOutputTokens: 700 };
+  const model = cleanEnv(process.env.GEMINI_MODEL) || 'gemini-2.5-flash';
+  // Urdu uses many tokens, so allow plenty of room.
+  const generationConfig = { temperature: 0.2, maxOutputTokens: 1200 };
   if (model.includes('2.5')) generationConfig.thinkingConfig = { thinkingBudget: 0 };
 
   let upstream;
@@ -160,12 +165,15 @@ export async function POST(request) {
       }
     );
   } catch (e) {
+    console.error('Gemini fetch failed:', e && e.name, e && e.message);
     return json({ error: 'upstream_unreachable' }, 502);
   }
 
   if (!upstream.ok) {
+    const errText = await upstream.text().catch(() => '');
+    console.error('Gemini error', upstream.status, errText.slice(0, 500));
     return json(
-      { error: upstream.status === 429 ? 'rate_limited' : 'upstream_error' },
+      { error: upstream.status === 429 ? 'rate_limited' : 'upstream_error', status: upstream.status },
       upstream.status === 429 ? 429 : 502
     );
   }
@@ -174,6 +182,7 @@ export async function POST(request) {
   try {
     data = await upstream.json();
   } catch (e) {
+    console.error('Gemini returned invalid JSON:', e && e.message);
     return json({ error: 'upstream_error' }, 502);
   }
 
@@ -184,7 +193,10 @@ export async function POST(request) {
     data.candidates[0].content &&
     data.candidates[0].content.parts;
   const text = Array.isArray(parts) ? parts.map((p) => p.text || '').join('').trim() : '';
-  if (!text) return json({ error: 'empty' }, 502);
+  if (!text) {
+    console.error('Gemini empty response:', JSON.stringify(data).slice(0, 500));
+    return json({ error: 'empty' }, 502);
+  }
 
   return json({ text: text.slice(0, 1500) });
 }
